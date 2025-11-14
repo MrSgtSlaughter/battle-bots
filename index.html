@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Twisted Metal Arena</title>
+    
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Load React, ReactDOM, and Babel for JSX transpilation -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Load Firebase Dependencies -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Expose Firebase functions globally for the Babel script to use
+        window.firebaseDependencies = { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, getFirestore, doc, setDoc, onSnapshot, getDoc };
+    </script>
+
+    <!-- Load Phaser 3 Library -->
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.55.2/dist/phaser.min.js"></script>
+
+    <style>
+        /* Font import for a futuristic look */
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap');
+        
+        body {
+            font-family: 'Orbitron', sans-serif;
+            background: linear-gradient(135deg, #0f172a, #000000);
+            color: #ecf0f1;
+            padding: 20px;
+        }
+
+        .arena-container {
+            width: 100%;
+            max-width: 1000px;
+            background: #27374d; /* Darker blue-grey */
+            border: 4px solid #1c2833;
+            border-radius: 20px;
+            box-shadow: 0 0 40px rgba(231, 76, 60, 0.3), inset 0 0 15px rgba(255, 255, 255, 0.1);
+            padding: 20px;
+            margin: 20px auto;
+        }
+
+        #phaser-game-container {
+            border: 5px solid #e74c3c;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            overflow: hidden; 
+        }
+        
+        #log {
+            min-height: 80px;
+            background: #1f2937;
+            border: 1px solid #3498db;
+            border-radius: 8px;
+            padding: 10px;
+            overflow-y: auto;
+            max-height: 120px;
+            font-size: 0.8rem;
+            color: #7f8c8d;
+        }
+
+        .key-tip {
+            display: inline-block;
+            background: #546e7a;
+            color: #fff;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            border-bottom: 3px solid #37474f;
+            line-height: 2;
+        }
+
+         .action-button {
+            cursor: pointer;
+            padding: 10px 15px;
+            border-radius: 10px;
+            font-weight: bold;
+            transition: all 0.15s ease-in-out;
+            box-shadow: 0 4px #1c2833;
+        }
+
+        .action-button:hover:not(:disabled) {
+            transform: translateY(1px);
+            box-shadow: 0 3px #1c2833;
+        }
+    </style>
+</head>
+<body>
+
+<div id="root"></div>
+
+<script>
+    // --- GLOBAL CANVAS/FIREBASE VARIABLES (MANDATORY INJECTION) ---
+    // Switched to 'var' to ensure true global scoping for access by the Babel script.
+    var __app_id = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    var __firebase_config = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
+    var __initial_auth_token = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : undefined;
+</script>
+
+<script type="text/babel">
+    const { useEffect, useRef, useState, useCallback } = React;
+    const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, getFirestore, doc, setDoc, onSnapshot, getDoc } = window.firebaseDependencies;
+
+    // --- GAME CONSTANTS ---
+    const GAME_STATE_PATH = 'multiplayer_arena_tm/game_state';
+    const ARENA_WIDTH = 1200; // Expanded Arena Size
+    const ARENA_HEIGHT = 700;
+    const BOT_BODY_RADIUS = 30;
+    const SYNC_WRITE_DELAY_MS = 150; // Debounce delay
+
+    // --- BOT & WEAPON SPECS ---
+    const BOT_SPECS = [
+        { id: 0, name: 'OUTLAW', maxHp: 500, primaryCD: 10, secondaryCD: 300, speed: 250, color: 0xF39C12, skin: 'car_orange', description: 'Balanced, fast repeater fire.' },
+        { id: 1, name: 'GRIM', maxHp: 400, primaryCD: 15, secondaryCD: 500, speed: 350, color: 0x3498DB, skin: 'car_blue', description: 'Fast, fragile, focuses on missiles.' },
+        { id: 2, name: 'SLAYER', maxHp: 650, primaryCD: 20, secondaryCD: 400, speed: 180, color: 0xE74C3C, skin: 'car_red', description: 'Heavy tank, powerful close-range shotgun.' },
+        { id: 3, name: 'VIXEN', maxHp: 350, primaryCD: 8, secondaryCD: 250, speed: 400, color: 0x9B59B6, skin: 'car_purple', description: 'Extremely fast, low defense, high DPS beam.' }
+    ];
+
+    // --- FIREBASE SETUP ---
+    let firebaseApp, firebaseAuth, firebaseDb, userId;
+    // Access the globally defined 'var' variables directly.
+    const appId = __app_id;
+    const firebaseConfig = JSON.parse(__firebase_config);
+
+    // --- GAME STATE MODEL (Initial State) ---
+    const getInitialBotsState = () => BOT_SPECS.map(spec => ({
+        id: spec.id,
+        name: spec.name,
+        hp: spec.maxHp,
+        x: 0, y: 0, 
+        angle: 0, 
+        isDead: false,
+        playerId: null, // Null indicates AI/unclaimed
+        primaryCooldown: 0,
+        secondaryCooldown: 0,
+        isFiring: false,
+        input: { vx: 0, vy: 0, fireP: false, fireS: false } // Client input state
+    }));
+
+    const initialGameState = { 
+        phase: 'LOBBY', // LOBBY, COUNTDOWN, IN_GAME, GAME_OVER
+        hostId: null,
+        timer: 10, // Used for countdown
+        bots: getInitialBotsState(),
+        projectiles: [],
+        events: [], // For syncing non-physics events like sound/particles
+    };
+
+    // --- REACT COMPONENT ---
+    function App() {
+        const gameContainerRef = useRef(null);
+        const logRef = useRef(null);
+        const phaserGameRef = useRef(null);
+        const sceneRef = useRef(null);
+        const dbWriteTimeoutRef = useRef(null);
+        const inputBufferRef = useRef({ vx: 0, vy: 0, fireP: false, fireS: false });
+
+        // Global Synced State
+        const [gameState, setGameState] = useState(initialGameState);
+        const [isAuthReady, setIsAuthReady] = useState(false);
+        const [mySelectedBotId, setMySelectedBotId] = useState(-1);
+        
+        // Derived State
+        const myBot = gameState.bots.find(b => b.playerId === userId);
+        const isHost = userId === gameState.hostId;
+
+        // Helper to log messages to the UI
+        const logMessage = useCallback((source, message, color = "text-gray-400") => {
+            const logElement = logRef.current;
+            if (logElement) {
+                const time = new Date().toLocaleTimeString();
+                logElement.innerHTML += `<div class="mb-1"><span class="text-xs text-blue-400">[${time}]</span> <span class="font-bold ${color}">${source}:</span> ${message}</div>`;
+                logElement.scrollTop = logElement.scrollHeight;
+            }
+        }, []);
+        
+        // --- FIREBASE INITIALIZATION & AUTH ---
+        useEffect(() => {
+            const initFirebase = async () => {
+                try {
+                    const parsedConfig = firebaseConfig;
+                    if (Object.keys(parsedConfig).length === 0) {
+                        console.error("Firebase config is missing.");
+                        return;
+                    }
+                    
+                    firebaseApp = initializeApp(parsedConfig);
+                    firebaseAuth = getAuth(firebaseApp);
+                    firebaseDb = getFirestore(firebaseApp);
+                    
+                    if (typeof __initial_auth_token !== 'undefined') {
+                        await signInWithCustomToken(firebaseAuth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(firebaseAuth);
+                    }
+                    
+                    userId = firebaseAuth.currentUser?.uid || crypto.randomUUID();
+
+                    // Initial host election attempt (optimistic)
+                    const docRef = doc(firebaseDb, `artifacts/${appId}/public/data/${GAME_STATE_PATH}`);
+                    const docSnap = await getDoc(docRef);
+
+                    if (!docSnap.exists()) {
+                        // If doc doesn't exist, this user claims host and initializes
+                        const initState = { ...initialGameState, hostId: userId };
+                        await setDoc(docRef, initState);
+                    }
+                    
+                    setIsAuthReady(true);
+                } catch (error) {
+                    console.error("Firebase initialization or auth failed:", error);
+                }
+            };
+            
+            // Check if dependencies are loaded before trying to initialize Firebase
+            if (window.firebaseDependencies) {
+                initFirebase();
+            } else {
+                 // Wait for the module to load and then initialize
+                 const checkDeps = setInterval(() => {
+                    if (window.firebaseDependencies) {
+                        clearInterval(checkDeps);
+                        initFirebase();
+                    }
+                 }, 100);
+            }
+            
+        }, []);
+        
+        // --- FIREBASE SYNC: Read Global State ---
+        useEffect(() => {
+            if (!isAuthReady) return;
+
+            const docRef = doc(firebaseDb, `artifacts/${appId}/public/data/${GAME_STATE_PATH}`);
+
+            const unsubscribe = onSnapshot(docRef, (docSnapshot) => {
+                if (docSnapshot.exists()) {
+                    const newState = docSnapshot.data();
+                    setGameState(newState);
+                }
+            }, (error) => {
+                console.error("Error listening to game state:", error);
+            });
+
+            return () => unsubscribe();
+        }, [isAuthReady]);
+
+        // --- FIREBASE SYNC: Write My Input to Global State (Throttled) ---
+        const syncMyInput = useCallback(() => {
+            if (!isAuthReady || !userId || !myBot || gameState.phase !== 'IN_GAME') return;
+            
+            // This function updates the current player's input state in the local React state.
+            // The Host's Debounce useEffect will see this local update and propagate the *entire* state.
+            setGameState(prev => {
+                const newBots = [...prev.bots];
+                const botIndex = newBots.findIndex(b => b.playerId === userId);
+                if (botIndex !== -1) {
+                    // Only update the input field of my bot
+                    newBots[botIndex].input = { ...inputBufferRef.current };
+                }
+                return { ...prev, bots: newBots };
+            });
+            
+        }, [isAuthReady, gameState.phase, myBot]);
+
+        // --- FIREBASE SYNC: Host Writes Authoritative State (DEBOUNCED) ---
+        useEffect(() => {
+            if (!isAuthReady || !isHost || gameState.phase !== 'IN_GAME') return;
+
+            const docRef = doc(firebaseDb, `artifacts/${appId}/public/data/${GAME_STATE_PATH}`);
+            
+            if (dbWriteTimeoutRef.current) {
+                clearTimeout(dbWriteTimeoutRef.current);
+            }
+
+            // Host writes the entire authoritative state (including calculated positions, projectiles)
+            dbWriteTimeoutRef.current = setTimeout(async () => {
+                try {
+                    // Deep clone state to prevent mutation issues with async operations
+                    const stateToSync = JSON.parse(JSON.stringify(gameState));
+                    await setDoc(docRef, stateToSync);
+                } catch (e) {
+                    console.error("Firestore sync error:", e);
+                    // Log resource exhaustion error specifically if it happens
+                    if (e.code === 'resource-exhausted') {
+                        console.warn("Write stream exhausted. Debounce may need adjustment.");
+                    }
+                }
+            }, SYNC_WRITE_DELAY_MS); 
+            
+            return () => {
+                if (dbWriteTimeoutRef.current) {
+                    clearTimeout(dbWriteTimeoutRef.current);
+                }
+            };
+        }, [isAuthReady, gameState, isHost]);
+
+        // --- LOBBY/GAME START ACTIONS ---
+        const handleBotSelection = (botId) => {
+            if (myBot) return; // Cannot change selection once assigned
+            setMySelectedBotId(botId);
+        };
+
+        const handleReady = async () => {
+            if (!isAuthReady || mySelectedBotId === -1 || myBot) return;
+            
+            // Find the bot object in the current state and assign the player ID
+            const docRef = doc(firebaseDb, `artifacts/${appId}/public/data/${GAME_STATE_PATH}`);
+            
+            const newBots = gameState.bots.map(bot => {
+                if (bot.id === mySelectedBotId && !bot.playerId) {
+                    return { 
+                        ...bot, 
+                        playerId: userId,
+                        hp: BOT_SPECS[mySelectedBotId].maxHp, // Reset HP
+                        isDead: false,
+                        x: Math.random() * ARENA_WIDTH,
+                        y: Math.random() * ARENA_HEIGHT
+                    };
+                }
+                return bot;
+            });
+            
+            try {
+                await setDoc(docRef, { ...gameState, bots: newBots });
+                logMessage("LOBBY", `${BOT_SPECS[mySelectedBotId].name} selected! Waiting for other players...`, "text-green-400");
+            } catch (e) {
+                console.error("Error setting bot selection:", e);
+            }
+        };
+        
+        const handleStartGame = async () => {
+            if (!isHost) return;
+            const readyPlayers = gameState.bots.filter(b => b.playerId && !b.isDead).length;
+
+            // If at least one human player has joined, start the countdown
+            if (readyPlayers > 0) {
+                const docRef = doc(firebaseDb, `artifacts/${appId}/public/data/${GAME_STATE_PATH}`);
+                // Reset timer and set phase to countdown
+                await setDoc(docRef, { ...gameState, phase: 'COUNTDOWN', timer: 5 });
+                logMessage("HOST", "Starting countdown!", "text-yellow-400");
+            } else {
+                logMessage("HOST", "Need at least one player to start.", "text-red-400");
+            }
+        }
+        
+        // --- PHASER 3 GAME LOGIC ---
+        useEffect(() => {
+            if (typeof window.Phaser === 'undefined' || !isAuthReady) return;
+            
+            let localPlayerBot; // Reference to the sprite of the current player's bot
+            let cursors; // Phaser input handler
+            let botSprites = new Map();
+            let projectileGroup;
+            
+            // --- SCENE 1: GameScene ---
+            class GameScene extends window.Phaser.Scene {
+                constructor() {
+                    super('GameScene');
+                }
+
+                preload() {
+                    this.load.setBaseURL('https://raw.githubusercontent.com/phaserjs/examples/master/public/assets/sprites/');
+                    // Load simple car skins from Phaser examples
+                    this.load.image('car_orange', 'car_orange.png');
+                    this.load.image('car_blue', 'car_blue.png');
+                    this.load.image('car_red', 'car_red.png');
+                    this.load.image('car_purple', 'car_purple.png');
+                    this.load.image('bullet', 'fireball.png');
+                    this.load.image('missile', 'missile.png');
+                }
+
+                create() {
+                    sceneRef.current = this; // Store reference to the scene
+                    this.physics.world.setBounds(0, 0, ARENA_WIDTH, ARENA_HEIGHT);
+                    
+                    // Arena Background
+                    this.add.rectangle(ARENA_WIDTH / 2, ARENA_HEIGHT / 2, ARENA_WIDTH, ARENA_HEIGHT, 0x1c2833).setDepth(-1);
+                    this.add.grid(ARENA_WIDTH / 2, ARENA_HEIGHT / 2, ARENA_WIDTH, ARENA_HEIGHT, 50, 50, 0x000000, 0.5, 0x34495e, 1).setDepth(-1);
+
+                    // Groups for physics
+                    this.botGroup = this.physics.add.group();
+                    projectileGroup = this.physics.add.group({ runChildUpdate: true });
+                    
+                    // Input setup
+                    cursors = this.input.keyboard.createCursorKeys();
+                    this.keys = this.input.keyboard.addKeys({
+                        'W': window.Phaser.Input.Keyboard.KeyCodes.W,
+                        'S': window.Phaser.Input.Keyboard.KeyCodes.S,
+                        'A': window.Phaser.Input.Keyboard.KeyCodes.A,
+                        'D': window.Phaser.Input.Keyboard.KeyCodes.D,
+                        'SPACE': window.Phaser.Input.Keyboard.KeyCodes.SPACE,
+                        'CTRL': window.Phaser.Input.Keyboard.KeyCodes.CTRL,
+                    });
+                    
+                    // Countdown text (initially hidden)
+                    this.countdownText = this.add.text(ARENA_WIDTH / 2, ARENA_HEIGHT / 2, '', { 
+                        fontSize: '150px', 
+                        color: '#ffdd00', 
+                        shadow: { offsetX: 5, offsetY: 5, color: '#000', fill: true } 
+                    }).setOrigin(0.5).setDepth(10).setVisible(false);
+
+                    // Host's authoritative collision handler (only executed by the host)
+                    if (isHost) {
+                        this.physics.add.overlap(this.botGroup, projectileGroup, (botSprite, projectile) => {
+                            const targetBot = gameState.bots.find(b => b.id === botSprite.getData('botId'));
+                            // Check if the projectile is hitting a different bot and is not from a dead bot
+                            if (targetBot && !targetBot.isDead && projectile.getData('ownerId') !== targetBot.id) {
+                                
+                                // Send damage event (host processes this in the update loop)
+                                // We don't modify the state here directly, but flag the projectile for removal
+                                botSprite.scene.events.emit('projectileHit', projectile, targetBot);
+                                projectile.destroy();
+                            }
+                        });
+                    }
+                }
+
+                update(time, delta) {
+                    // Countdown logic (Host only)
+                    if (isHost && gameState.phase === 'COUNTDOWN') {
+                        // Logic to calculate the current timer value
+                        if (time > (this.countdownStartTime || 0)) {
+                            const timeLeft = 5 - Math.floor((time - this.countdownStartTime) / 1000);
+                            
+                            // Only update Firestore if timer changes
+                            if (timeLeft !== gameState.timer && timeLeft >= 0) {
+                                // Update React state locally first
+                                setGameState(prev => ({ ...prev, timer: timeLeft }));
+                                
+                                // Also write to Firestore immediately (not debounced)
+                                const docRef = doc(firebaseDb, `artifacts/${appId}/public/data/${GAME_STATE_PATH}`);
+                                setDoc(docRef, { ...gameState, timer: timeLeft, phase: 'COUNTDOWN' });
+
+                                if (timeLeft === 0) {
+                                    // Start game after a small delay
+                                     setTimeout(() => {
+                                        setGameState(prev => ({ ...prev, phase: 'IN_GAME', timer: 0 }));
+                                        setDoc(docRef, { ...gameState, phase: 'IN_GAME', timer: 0 });
+                                     }, 500);
+                                }
+                            }
+                        }
+                    }
+
+                    // Store countdown start time when phase switches
+                    if (gameState.phase === 'COUNTDOWN' && !this.countdownStartTime) {
+                         this.countdownStartTime = time;
+                    }
+                    if (gameState.phase !== 'COUNTDOWN') {
+                         this.countdownStartTime = null;
+                    }
+
+                    // Show/Hide countdown text based on phase
+                    this.countdownText.setVisible(gameState.phase === 'COUNTDOWN');
+                    if (gameState.phase === 'COUNTDOWN') {
+                        this.countdownText.setText(gameState.timer > 0 ? gameState.timer : 'GO!');
+                    }
+
+                    if (gameState.phase !== 'IN_GAME') {
+                        return;
+                    }
+                    
+                    // --- 1. HOST AUTHORITATIVE LOGIC ---
+                    if (isHost) {
+                        let newBots = [...gameState.bots];
+                        let newProjectiles = [...gameState.projectiles];
+                        let damageEvents = [];
+
+                        // a) Process Player Inputs & AI
+                        newBots.forEach(bot => {
+                            if (bot.isDead) { botSprites.get(bot.id)?.setVisible(false); return; }
+
+                            const botSpec = BOT_SPECS[bot.id];
+                            const botSprite = botSprites.get(bot.id);
+                            if (!botSprite) return;
+
+                            let input = bot.input;
+                            let speed = botSpec.speed;
+
+                            // Apply movement from input
+                            this.physics.velocityFromRotation(botSprite.rotation, input.vy > 0 ? -speed : (input.vy < 0 ? speed : 0), botSprite.body.velocity);
+                            botSprite.body.setAngularVelocity(input.vx * 150);
+                            bot.angle = botSprite.angle; // Sync angle back
+
+                            // Decrement cooldowns
+                            bot.primaryCooldown = Math.max(0, bot.primaryCooldown - 1);
+                            bot.secondaryCooldown = Math.max(0, bot.secondaryCooldown - 1);
+
+                            // Primary Attack Logic
+                            if (input.fireP && bot.primaryCooldown === 0) {
+                                bot.primaryCooldown = botSpec.primaryCD;
+                                const projectile = this.physics.add.sprite(bot.x, bot.y, 'bullet').setScale(0.5);
+                                projectile.setCircle(projectile.width / 2);
+                                projectile.setCollideWorldBounds(true);
+                                projectile.setBounce(0.5);
+                                this.physics.velocityFromRotation(botSprite.rotation, 500, projectile.body.velocity);
+                                
+                                // Store data on the projectile sprite
+                                projectile.setData('ownerId', bot.id); 
+                                projectile.setData('damage', 50);
+                                projectile.setData('type', 'bullet');
+
+                                projectileGroup.add(projectile);
+                                newProjectiles.push({
+                                    id: Math.random(), 
+                                    x: botSprite.x, y: botSprite.y,
+                                    angle: botSprite.rotation,
+                                    vx: projectile.body.velocity.x,
+                                    vy: projectile.body.velocity.y,
+                                    ownerId: bot.id,
+                                    damage: 50,
+                                    type: 'bullet'
+                                });
+                            }
+                            
+                            // Secondary Attack Logic (Simple Missile Example)
+                            if (input.fireS && bot.secondaryCooldown === 0) {
+                                bot.secondaryCooldown = botSpec.secondaryCD;
+                                logMessage("HOST", `${bot.name} launched a missile!`, bot.playerId === userId ? "text-cyan-300" : "text-red-300");
+
+                                const projectile = this.physics.add.sprite(bot.x, bot.y, 'missile').setScale(0.5).setRotation(botSprite.rotation);
+                                projectile.setCollideWorldBounds(true);
+                                
+                                // Store data on the projectile sprite
+                                projectile.setData('ownerId', bot.id); 
+                                projectile.setData('damage', 120);
+                                projectile.setData('type', 'missile');
+
+                                this.physics.velocityFromRotation(botSprite.rotation, 300, projectile.body.velocity);
+
+                                projectileGroup.add(projectile);
+                                newProjectiles.push({
+                                    id: Math.random(), 
+                                    x: botSprite.x, y: botSprite.y,
+                                    angle: botSprite.rotation,
+                                    vx: projectile.body.velocity.x,
+                                    vy: projectile.body.velocity.y,
+                                    ownerId: bot.id,
+                                    damage: 120,
+                                    type: 'missile'
+                                });
+                            }
+                        });
+
+                        // b) Collision Processing (Gather all damage events from the Phaser engine)
+                        this.events.off('projectileHit'); // Clear old listener
+                        this.events.on('projectileHit', (projectile, targetBot) => {
+                            // Store damage event to process after the loop
+                            damageEvents.push({ botId: targetBot.id, damage: projectile.getData('damage'), attackerId: projectile.getData('ownerId') });
+                        });
+                        
+                        // Run the Phaser physics step (essential for host)
+                        this.physics.world.update(time, delta);
+
+                        // c) Apply damage events and update positions
+                        damageEvents.forEach(event => {
+                            const target = newBots.find(b => b.id === event.botId);
+                            if (target) {
+                                target.hp = Math.max(0, target.hp - event.damage);
+                                if (target.hp <= 0 && !target.isDead) {
+                                    target.isDead = true;
+                                    logMessage("SYSTEM", `${target.name} has been destroyed!`, "text-red-500");
+                                }
+                            }
+                        });
+
+                        // d) Update Phaser sprites and sync back to state (HOST ONLY)
+                        newBots = newBots.map(bot => {
+                            const botSprite = botSprites.get(bot.id);
+                            if (botSprite && bot.playerId) {
+                                return { ...bot, x: botSprite.x, y: botSprite.y, angle: botSprite.angle };
+                            }
+                            return bot;
+                        });
+                        
+                        // Set the authoritative state
+                        setGameState(prev => ({ 
+                            ...prev, 
+                            bots: newBots, 
+                            projectiles: newProjectiles.filter(p => p.active), // Filter projectiles that left the world
+                            // Host runs win check here
+                            phase: newBots.filter(b => b.playerId && !b.isDead).length <= 1 ? 'GAME_OVER' : 'IN_GAME',
+                        }));
+
+                    } else {
+                        // --- 2. CLIENT INPUT LOGIC (Non-Host) ---
+                        // Clients only update their *input* state in the local React state.
+                        if (myBot) {
+                            let vx = 0, vy = 0;
+                            let fireP = false, fireS = false;
+                            
+                            // Rotational movement (A/D)
+                            if (this.keys.A.isDown || cursors.left.isDown) vx = -1;
+                            if (this.keys.D.isDown || cursors.right.isDown) vx = 1;
+
+                            // Forward/Backward movement (W/S)
+                            if (this.keys.W.isDown || cursors.up.isDown) vy = -1; // -1 for moving forward (reverse of screen coords)
+                            if (this.keys.S.isDown || cursors.down.isDown) vy = 1; 
+
+                            // Fire buttons
+                            if (this.keys.SPACE.isDown) fireP = true;
+                            if (this.keys.CTRL.isDown) fireS = true;
+
+                            // Update the local input buffer which is checked by syncMyInput
+                            inputBufferRef.current = { vx, vy, fireP, fireS };
+                            syncMyInput();
+                        }
+                    }
+                    
+                    // --- 3. CLIENT VISUAL SYNC LOGIC (All Clients) ---
+                    
+                    // Bot Sprites Synchronization (Move all sprites to synced coordinates)
+                    gameState.bots.forEach(bot => {
+                        if (!botSprites.has(bot.id) && bot.playerId) {
+                            const spec = BOT_SPECS[bot.id];
+                            const botSprite = this.physics.add.sprite(bot.x, bot.y, spec.skin).setScale(0.8);
+                            botSprite.setCircle(BOT_BODY_RADIUS);
+                            botSprite.setCollideWorldBounds(true);
+                            botSprite.setImmovable(!isHost); // Only host's physics moves the sprite body
+                            botSprite.setDrag(100, 100);
+                            botSprite.setBounce(0.5);
+                            botSprite.setAngle(bot.angle);
+                            botSprite.setDepth(1);
+                            botSprite.setTint(bot.color);
+                            botSprite.setData('botId', bot.id);
+
+                            this.botGroup.add(botSprite);
+                            botSprites.set(bot.id, botSprite);
+                            
+                        } else if (botSprites.has(bot.id)) {
+                            const botSprite = botSprites.get(bot.id);
+                            if (bot.isDead) {
+                                botSprite.setVisible(false);
+                                botSprite.body.checkCollision.none = true;
+                            } else {
+                                // Non-host clients move their sprites to the authoritative positions
+                                if (!isHost) {
+                                    botSprite.x = bot.x;
+                                    botSprite.y = bot.y;
+                                    botSprite.angle = bot.angle;
+                                }
+                                // Local player needs to update its body's velocity for smooth movement even if host
+                                if (bot.playerId === userId) {
+                                    localPlayerBot = botSprite;
+                                    this.cameras.main.startFollow(localPlayerBot, true, 0.05, 0.05);
+                                }
+                            }
+                        }
+                    });
+                    
+                    // Projectiles Visualization (Clients create/destroy sprites based on sync state)
+                    
+                    // First, remove projectiles that are no longer in the synced state
+                    projectileGroup.getChildren().forEach(projSprite => {
+                        const isSynced = gameState.projectiles.some(p => p.id === projSprite.getData('syncId'));
+                        if (!isSynced) {
+                            projSprite.destroy();
+                        }
+                    });
+                    
+                    // Add/Update new projectiles
+                    gameState.projectiles.forEach(p => {
+                        let projSprite = projectileGroup.getChildren().find(s => s.getData('syncId') === p.id);
+                        
+                        if (!projSprite) {
+                            // Create new projectile sprite
+                            projSprite = this.add.image(p.x, p.y, p.type === 'missile' ? 'missile' : 'bullet').setScale(0.5);
+                            projSprite.setData('syncId', p.id);
+                            projSprite.setRotation(p.angle);
+                            projSprite.setDepth(2);
+                            // Add to physics group only if host (to enable collision checking)
+                            if (isHost) {
+                                projectileGroup.add(projSprite);
+                                projSprite.body.setCircle(10);
+                                projSprite.body.setAllowGravity(false);
+                                projSprite.body.velocity.x = p.vx;
+                                projSprite.body.velocity.y = p.vy;
+                            } else {
+                                // Non-host clients move based on their own simple interpolation/sync
+                                projSprite.x = p.x;
+                                projSprite.y = p.y;
+                                
+                            }
+                            
+                        } else if (!isHost) {
+                             // Non-host clients update position
+                            projSprite.x = p.x;
+                            projSprite.y = p.y;
+                        }
+                    });
+                }
+            }
+            // --- PHASER GAME CONFIGURATION ---
+            const config = {
+                type: window.Phaser.AUTO,
+                width: gameContainerRef.current.offsetWidth,
+                height: ARENA_HEIGHT,
+                parent: gameContainerRef.current,
+                scene: [GameScene],
+                physics: {
+                    default: 'arcade',
+                    arcade: {
+                        debug: false,
+                        gravity: { y: 0 }
+                    }
+                },
+                scale: {
+                    mode: window.Phaser.Scale.FIT,
+                    autoCenter: window.Phaser.Scale.CENTER_BOTH
+                }
+            };
+
+            phaserGameRef.current = new window.Phaser.Game(config);
+
+            return () => {
+                if (phaserGameRef.current) {
+                    phaserGameRef.current.destroy(true);
+                    phaserGameRef.current = null;
+                }
+            };
+        }, [isAuthReady, isHost, gameState.phase, gameState.bots.length, gameState.projectiles, syncMyInput, logMessage]); // Re-init on auth, host change, or critical state change
+
+        // --- RENDER UI ---
+        return (
+            <div className="arena-container">
+                <h1 className="text-4xl text-center mb-6 text-red-500 font-bold tracking-wider uppercase shadow-red-900">Twisted Metal Arena</h1>
+                <p className="text-sm text-center text-gray-500 mb-2">User ID: {userId ? userId.substring(0, 8) + '...' : 'Loading...'}</p>
+                
+                <div ref={gameContainerRef} id="phaser-game-container" style={{ width: '100%', aspectRatio: `${ARENA_WIDTH}/${ARENA_HEIGHT}` }}>
+                    {/* Phaser canvas will be injected here */}
+                </div>
+                
+                {gameState.phase === 'LOBBY' && (
+                    <div className="lobby-panel p-4 mt-4 bg-slate-700 rounded-lg shadow-xl">
+                        <h2 className="text-2xl font-bold text-yellow-300 mb-4 text-center">Bot Selection ({myBot ? 'JOINED' : 'LOBBY'})</h2>
+                        
+                        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+                            {BOT_SPECS.map(spec => {
+                                const botState = gameState.bots.find(b => b.id === spec.id);
+                                const isClaimed = botState && botState.playerId !== null;
+                                const isMyBot = botState && botState.playerId === userId;
+                                const isSelected = mySelectedBotId === spec.id;
+                                
+                                return (
+                                    <div 
+                                        key={spec.id}
+                                        onClick={() => handleBotSelection(spec.id)}
+                                        className={`p-3 rounded-lg border-4 cursor-pointer transition-all ${isMyBot ? 'border-green-400 bg-green-900/50' : (isClaimed ? 'border-red-500 bg-red-900/50 opacity-50 cursor-not-allowed' : (isSelected ? 'border-yellow-400 bg-yellow-900/50' : 'border-slate-600 hover:border-blue-400 bg-slate-800'))}`}
+                                    >
+                                        <h3 className="text-xl font-extrabold" style={{ color: `#${spec.color.toString(16)}` }}>{spec.name}</h3>
+                                        <p className="text-xs text-gray-400">HP: {spec.maxHp} | Speed: {spec.speed}</p>
+                                        <p className="text-sm italic mt-1">{spec.description}</p>
+                                        <p className="text-xs mt-2 font-mono">
+                                            {isMyBot ? 'YOU' : (isClaimed ? `Player: ${botState.playerId.substring(0, 4)}...` : 'AVAILABLE')}
+                                        </p>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                        
+                        {!myBot && (
+                            <button 
+                                onClick={handleReady}
+                                disabled={mySelectedBotId === -1}
+                                className={`w-full action-button text-white font-bold py-3 px-4 rounded-xl transition-all ${mySelectedBotId !== -1 ? 'bg-green-600 hover:bg-green-700 shadow-green-900' : 'bg-gray-500 cursor-not-allowed'}`}
+                            >
+                                {mySelectedBotId !== -1 ? `READY UP as ${BOT_SPECS[mySelectedBotId].name}` : 'Select a Bot to Ready Up'}
+                            </button>
+                        )}
+                        
+                        {isHost && (
+                            <button 
+                                onClick={handleStartGame}
+                                className="w-full mt-2 action-button text-white font-bold py-3 px-4 rounded-xl bg-purple-600 hover:bg-purple-700 shadow-purple-900"
+                                disabled={gameState.bots.filter(b => b.playerId).length < 1}
+                            >
+                                {gameState.bots.filter(b => b.playerId).length < 1 ? 'WAITING FOR PLAYERS (Host)' : 'START COUNTDOWN (Host)'}
+                            </button>
+                        )}
+                    </div>
+                )}
+                
+                {/* Controls & Status Bar */}
+                {(gameState.phase === 'IN_GAME' || gameState.phase === 'COUNTDOWN') && (
+                    <div className="mt-4 p-3 bg-slate-800 rounded-lg flex justify-between items-center shadow-inner">
+                        <div className="text-left">
+                            <p className="text-xl font-bold text-yellow-400">STATUS: {myBot ? myBot.name : 'Spectating'}</p>
+                            {myBot && (
+                                <p className="text-sm text-gray-300">HP: <span className="text-red-400">{myBot.hp}</span>/{BOT_SPECS[myBot.id].maxHp}</p>
+                            )}
+                            <p className="text-xs text-gray-400 mt-1">
+                                <span className="key-tip">W A S D</span> / <span className="key-tip">Arrows</span> Move | 
+                                <span className="key-tip ml-2">SPACE</span> Primary | 
+                                <span className="key-tip ml-2">CTRL</span> Secondary
+                            </p>
+                        </div>
+                        <div className="text-right">
+                            <p className="text-lg text-red-500 font-extrabold">PHASE: {gameState.phase.replace('_', ' ')}</p>
+                            {isHost && <p className="text-xs text-green-400">STATUS: HOST</p>}
+                        </div>
+                    </div>
+                )}
+
+                {/* Log Area */}
+                <div id="log-container" className="mt-4">
+                    <p className="text-sm text-gray-400 mb-2">BATTLE LOG:</p>
+                    <div ref={logRef} id="log"></div>
+                </div>
+
+                 {/* Message Box (Modal replacement) */}
+                <div id="message-box" className={`fixed inset-0 bg-black bg-opacity-70 z-50 flex items-center justify-center ${gameState.phase === 'GAME_OVER' ? '' : 'hidden'}`}>
+                    <div className="bg-slate-700 p-8 rounded-xl shadow-2xl w-full max-w-sm text-center border-4 border-yellow-500">
+                        <h3 className="text-3xl mb-4 text-green-500">
+                            GAME OVER!
+                        </h3>
+                        <p className="text-lg text-white mb-6">
+                            {gameState.bots.filter(b => b.playerId && !b.isDead).length === 1 
+                                ? `${gameState.bots.find(b => b.playerId && !b.isDead)?.name} is the champion!` 
+                                : 'No winner determined (Draw/Spectator mode).'}
+                        </p>
+                        <button onClick={() => {
+                            // Reset phase and attempt to reclaim host if necessary
+                            const docRef = doc(firebaseDb, `artifacts/${appId}/public/data/${GAME_STATE_PATH}`);
+                            setDoc(docRef, { ...initialGameState, hostId: gameState.hostId || userId });
+                            setMySelectedBotId(-1);
+                        }} className="action-button bg-blue-600 hover:bg-blue-700 text-white shadow-blue-900">
+                            RETURN TO LOBBY
+                        </button>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+    
+    // Render the React App component into the root element
+    const container = document.getElementById('root');
+    const root = ReactDOM.createRoot(container);
+    root.render(<App />);
+
+</script>
+
+</body>
+</html>
